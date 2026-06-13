@@ -5,9 +5,10 @@ import android.content.SharedPreferences
 import android.graphics.*
 import android.hardware.*
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.service.wallpaper.WallpaperService
 import android.view.SurfaceHolder
-import kotlin.math.abs
 
 class ParallaxWallpaperService : WallpaperService() {
 
@@ -18,6 +19,8 @@ class ParallaxWallpaperService : WallpaperService() {
         private lateinit var sensorManager: SensorManager
         private var gyroscope: Sensor? = null
         private lateinit var prefs: SharedPreferences
+
+        private val drawHandler = Handler(Looper.getMainLooper())
 
         private var rotX = 0f
         private var rotY = 0f
@@ -38,7 +41,7 @@ class ParallaxWallpaperService : WallpaperService() {
             override fun run() {
                 if (running) {
                     drawFrame()
-                    handler.postDelayed(this, 16) // ~60fps
+                    drawHandler.postDelayed(this, 16)
                 }
             }
         }
@@ -58,38 +61,25 @@ class ParallaxWallpaperService : WallpaperService() {
         }
 
         private fun loadImage() {
+            layers.forEach { it.bitmap.recycle() }
             layers.clear()
             val uriStr = prefs.getString(KEY_IMAGE_URI, null) ?: return
             try {
                 val uri = Uri.parse(uriStr)
-                val options = BitmapFactory.Options().apply { inSampleSize = 1 }
                 val original = contentResolver.openInputStream(uri)?.use {
-                    BitmapFactory.decodeStream(it, null, options)
+                    BitmapFactory.decodeStream(it)
                 } ?: return
-
-                // Create 3 parallax layers from the same image with different scales/offsets
-                // Layer 0 (back) - slightly zoomed out, moves least
-                // Layer 1 (mid) - normal size
-                // Layer 2 (front) - slightly zoomed in, moves most
 
                 val w = original.width
                 val h = original.height
 
-                // Back layer - full image, slight zoom
-                val backBmp = Bitmap.createScaledBitmap(original,
-                    (w * 1.15f).toInt(), (h * 1.15f).toInt(), true)
+                val backBmp = Bitmap.createScaledBitmap(original, (w * 1.15f).toInt(), (h * 1.15f).toInt(), true)
+                val midBmp = Bitmap.createScaledBitmap(original, (w * 1.1f).toInt(), (h * 1.1f).toInt(), true)
+                val frontBmp = Bitmap.createScaledBitmap(original, (w * 1.05f).toInt(), (h * 1.05f).toInt(), true)
 
-                // Mid layer - normal
-                val midBmp = Bitmap.createScaledBitmap(original,
-                    (w * 1.1f).toInt(), (h * 1.1f).toInt(), true)
-
-                // Front layer - zoomed in, draw with low opacity to simulate depth
-                val frontBmp = Bitmap.createScaledBitmap(original,
-                    (w * 1.05f).toInt(), (h * 1.05f).toInt(), true)
-
-                layers.add(ParallaxLayer(backBmp, depthFactor = 0.3f, alpha = 255))
-                layers.add(ParallaxLayer(midBmp, depthFactor = 0.6f, alpha = 200))
-                layers.add(ParallaxLayer(frontBmp, depthFactor = 1.0f, alpha = 140))
+                layers.add(ParallaxLayer(backBmp, 0.3f, 255))
+                layers.add(ParallaxLayer(midBmp, 0.6f, 180))
+                layers.add(ParallaxLayer(frontBmp, 1.0f, 120))
 
                 original.recycle()
             } catch (e: Exception) {
@@ -109,32 +99,35 @@ class ParallaxWallpaperService : WallpaperService() {
             if (visible) {
                 loadSettings()
                 loadImage()
-                gyroscope?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
-                handler.post(drawRunnable)
+                gyroscope?.let {
+                    sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+                }
+                drawHandler.post(drawRunnable)
             } else {
                 sensorManager.unregisterListener(this)
-                handler.removeCallbacks(drawRunnable)
+                drawHandler.removeCallbacks(drawRunnable)
             }
         }
 
         override fun onSensorChanged(event: SensorEvent) {
-            if (event.sensor.type == Sensor.TYPE_GYROSCOPE) {
-                val dt = 0.016f
-                rotX += event.values[0] * dt * sensitivity * 10f
-                rotY += event.values[1] * dt * sensitivity * 10f
-                // Clamp
-                rotX = rotX.coerceIn(-80f, 80f)
-                rotY = rotY.coerceIn(-80f, 80f)
-                // Drift back to center slowly
-                rotX *= 0.98f
-                rotY *= 0.98f
-                targetX = rotY
-                targetY = rotX
-            } else if (event.sensor.type == Sensor.TYPE_ROTATION_VECTOR) {
-                val mat = FloatArray(9)
-                SensorManager.getRotationMatrixFromVector(mat, event.values)
-                targetX = -mat[1] * sensitivity * 60f
-                targetY = mat[3] * sensitivity * 60f
+            val dt = 0.016f
+            when (event.sensor.type) {
+                Sensor.TYPE_GYROSCOPE -> {
+                    rotX += event.values[0] * dt * sensitivity * 10f
+                    rotY += event.values[1] * dt * sensitivity * 10f
+                    rotX = rotX.coerceIn(-80f, 80f)
+                    rotY = rotY.coerceIn(-80f, 80f)
+                    rotX *= 0.98f
+                    rotY *= 0.98f
+                    targetX = rotY
+                    targetY = rotX
+                }
+                Sensor.TYPE_ROTATION_VECTOR -> {
+                    val mat = FloatArray(9)
+                    SensorManager.getRotationMatrixFromVector(mat, event.values)
+                    targetX = -mat[1] * sensitivity * 60f
+                    targetY = mat[3] * sensitivity * 60f
+                }
             }
         }
 
@@ -144,40 +137,31 @@ class ParallaxWallpaperService : WallpaperService() {
             val holder = surfaceHolder
             var canvas: Canvas? = null
             try {
-                canvas = holder.lockCanvas()
-                canvas?.let { c ->
-                    // Smooth interpolation
-                    smoothX += (targetX - smoothX) * 0.08f
-                    smoothY += (targetY - smoothY) * 0.08f
+                canvas = holder.lockCanvas() ?: return
+                smoothX += (targetX - smoothX) * 0.08f
+                smoothY += (targetY - smoothY) * 0.08f
 
-                    c.drawColor(Color.BLACK)
+                canvas.drawColor(Color.BLACK)
 
-                    if (layers.isEmpty()) {
-                        // Draw placeholder
-                        val p = Paint().apply { color = Color.DKGRAY; textSize = 40f; textAlign = Paint.Align.CENTER }
-                        c.drawRect(0f, 0f, screenW.toFloat(), screenH.toFloat(), p)
-                        p.color = Color.WHITE
-                        c.drawText("Set image in app", screenW / 2f, screenH / 2f, p)
-                        return
+                if (layers.isEmpty()) {
+                    val p = Paint().apply {
+                        color = Color.WHITE
+                        textSize = 42f
+                        textAlign = Paint.Align.CENTER
                     }
-
-                    // Draw each layer with parallax offset
-                    layers.forEachIndexed { _, layer ->
-                        val offsetX = smoothX * layer.depthFactor
-                        val offsetY = smoothY * layer.depthFactor
-
-                        val bw = layer.bitmap.width.toFloat()
-                        val bh = layer.bitmap.height.toFloat()
-
-                        // Center + offset
-                        val left = (screenW - bw) / 2f + offsetX
-                        val top = (screenH - bh) / 2f + offsetY
-
-                        drawPaint.alpha = layer.alpha
-                        c.drawBitmap(layer.bitmap, left, top, drawPaint)
-                    }
-                    drawPaint.alpha = 255
+                    canvas.drawText("Set image in app", screenW / 2f, screenH / 2f, p)
+                    return
                 }
+
+                layers.forEach { layer ->
+                    val offsetX = smoothX * layer.depthFactor
+                    val offsetY = smoothY * layer.depthFactor
+                    val left = (screenW - layer.bitmap.width) / 2f + offsetX
+                    val top = (screenH - layer.bitmap.height) / 2f + offsetY
+                    drawPaint.alpha = layer.alpha
+                    canvas.drawBitmap(layer.bitmap, left, top, drawPaint)
+                }
+                drawPaint.alpha = 255
             } finally {
                 canvas?.let { holder.unlockCanvasAndPost(it) }
             }
@@ -187,17 +171,13 @@ class ParallaxWallpaperService : WallpaperService() {
             super.onDestroy()
             running = false
             sensorManager.unregisterListener(this)
-            handler.removeCallbacks(drawRunnable)
+            drawHandler.removeCallbacks(drawRunnable)
             layers.forEach { it.bitmap.recycle() }
             layers.clear()
         }
     }
 
-    data class ParallaxLayer(
-        val bitmap: Bitmap,
-        val depthFactor: Float,
-        val alpha: Int
-    )
+    data class ParallaxLayer(val bitmap: Bitmap, val depthFactor: Float, val alpha: Int)
 
     companion object {
         const val PREFS = "parallax_prefs"
