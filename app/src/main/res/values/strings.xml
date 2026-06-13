@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Parallax Wallpaper</string>
+    <string name="wallpaper_desc">3D parallax live wallpaper using gyroscope</string>
+</resources>
