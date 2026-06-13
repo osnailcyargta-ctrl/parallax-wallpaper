@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.WallpaperManager
 import android.content.*
 import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -12,6 +13,8 @@ import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import java.io.File
+import java.io.FileOutputStream
 
 class MainActivity : AppCompatActivity() {
 
@@ -19,7 +22,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var previewImage: ImageView
     private lateinit var sensitivitySlider: SeekBar
     private lateinit var sensitivityLabel: TextView
-    private var selectedUri: Uri? = null
 
     companion object {
         const val REQ_IMAGE = 201
@@ -35,16 +37,17 @@ class MainActivity : AppCompatActivity() {
         sensitivitySlider = findViewById(R.id.sensitivity_slider)
         sensitivityLabel = findViewById(R.id.sensitivity_label)
 
-        // Load saved sensitivity
         val savedSens = prefs.getFloat(ParallaxWallpaperService.KEY_SENSITIVITY, 5f)
         sensitivitySlider.progress = (savedSens * 10).toInt()
         updateSensLabel(savedSens)
 
-        // Load saved image
-        val savedUri = prefs.getString(ParallaxWallpaperService.KEY_IMAGE_URI, null)
-        if (savedUri != null) {
+        // Load saved preview
+        val savedPath = prefs.getString(ParallaxWallpaperService.KEY_IMAGE_PATH, null)
+        if (savedPath != null && File(savedPath).exists()) {
             try {
-                previewImage.setImageURI(Uri.parse(savedUri))
+                val opts = BitmapFactory.Options().apply { inSampleSize = 4 }
+                val bm = BitmapFactory.decodeFile(savedPath, opts)
+                previewImage.setImageBitmap(bm)
             } catch (e: Exception) {}
         }
 
@@ -97,27 +100,75 @@ class MainActivity : AppCompatActivity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == REQ_IMAGE && resultCode == RESULT_OK && data?.data != null) {
-            val uri = data.data!!
-            // Persist URI permission
-            contentResolver.takePersistableUriPermission(uri,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            selectedUri = uri
-            prefs.edit().putString(ParallaxWallpaperService.KEY_IMAGE_URI, uri.toString()).apply()
-            previewImage.setImageURI(uri)
-            Toast.makeText(this, "Image selected!", Toast.LENGTH_SHORT).show()
+        if (requestCode == REQ_IMAGE && resultCode == RESULT_OK) {
+            val uri = data?.data ?: return
+            copyImageToInternal(uri)
+        }
+    }
+
+    private fun copyImageToInternal(uri: Uri) {
+        try {
+            // Copy gambar ke internal storage — hindari URI permission issues
+            val inStream = contentResolver.openInputStream(uri) ?: run {
+                Toast.makeText(this, "Gagal buka gambar", Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            // Decode dengan downsample biar ga OOM
+            val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeStream(inStream, null, opts)
+            inStream.close()
+
+            val maxSize = 2048
+            var sample = 1
+            while (opts.outWidth / sample > maxSize || opts.outHeight / sample > maxSize) {
+                sample *= 2
+            }
+
+            val inStream2 = contentResolver.openInputStream(uri) ?: return
+            val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sample }
+            val bitmap = BitmapFactory.decodeStream(inStream2, null, decodeOpts)
+            inStream2.close()
+
+            if (bitmap == null) {
+                Toast.makeText(this, "Gagal decode gambar", Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            // Save ke internal storage
+            val file = File(filesDir, "wallpaper_source.jpg")
+            FileOutputStream(file).use { out ->
+                bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 90, out)
+            }
+            bitmap.recycle()
+
+            val path = file.absolutePath
+            prefs.edit().putString(ParallaxWallpaperService.KEY_IMAGE_PATH, path).apply()
+
+            // Show preview
+            val previewOpts = BitmapFactory.Options().apply { inSampleSize = 4 }
+            val previewBm = BitmapFactory.decodeFile(path, previewOpts)
+            previewImage.setImageBitmap(previewBm)
+
+            Toast.makeText(this, "Gambar dipilih!", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "Error: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
 
     private fun setAsWallpaper() {
-        if (prefs.getString(ParallaxWallpaperService.KEY_IMAGE_URI, null) == null) {
-            Toast.makeText(this, "Pick an image first!", Toast.LENGTH_SHORT).show()
+        if (prefs.getString(ParallaxWallpaperService.KEY_IMAGE_PATH, null) == null) {
+            Toast.makeText(this, "Pilih gambar dulu!", Toast.LENGTH_SHORT).show()
             return
         }
-        val intent = Intent(WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER).apply {
-            putExtra(WallpaperManager.EXTRA_LIVE_WALLPAPER_COMPONENT,
-                ComponentName(this@MainActivity, ParallaxWallpaperService::class.java))
+        try {
+            val intent = Intent(WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER).apply {
+                putExtra(WallpaperManager.EXTRA_LIVE_WALLPAPER_COMPONENT,
+                    ComponentName(this@MainActivity, ParallaxWallpaperService::class.java))
+            }
+            startActivity(intent)
+        } catch (e: Exception) {
+            Toast.makeText(this, "Error: ${e.message}", Toast.LENGTH_LONG).show()
         }
-        startActivity(intent)
     }
 }
